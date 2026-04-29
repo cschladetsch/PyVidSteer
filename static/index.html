@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InteractiveGen</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0a0a0a;
+            color: #e0e0e0;
+            font-family: system-ui, -apple-system, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #video-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #video {
+            max-width: 100%;
+            max-height: 100%;
+            background: #000;
+        }
+
+        #state-badge {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            padding: 0.3rem 0.8rem;
+            border-radius: 1rem;
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            background: #111;
+            border: 1px solid #333;
+            transition: color 0.3s, border-color 0.3s;
+        }
+
+        #state-badge.IDLE_LOOP               { color: #4ade80; border-color: #4ade80; }
+        #state-badge.GENERATING_TARGET       { color: #facc15; border-color: #facc15; }
+        #state-badge.GENERATING_TRANSITION   { color: #fb923c; border-color: #fb923c; }
+        #state-badge.PLAYING_TRANSITION      { color: #60a5fa; border-color: #60a5fa; }
+
+        #idle-message {
+            position: absolute;
+            color: #555;
+            font-size: 1rem;
+            pointer-events: none;
+        }
+
+        #prompt-area {
+            background: #111;
+            border-top: 1px solid #1e1e1e;
+            padding: 0.75rem 1rem;
+        }
+
+        #rejection-msg {
+            color: #f87171;
+            font-size: 0.8rem;
+            min-height: 1.2rem;
+            margin-bottom: 0.4rem;
+        }
+
+        #prompt-row {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        #prompt-input {
+            flex: 1;
+            padding: 0.65rem 1rem;
+            border-radius: 0.4rem;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            color: #e0e0e0;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+
+        #prompt-input:focus { border-color: #444; }
+
+        #prompt-submit {
+            padding: 0.65rem 1.4rem;
+            border-radius: 0.4rem;
+            background: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            color: #e0e0e0;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        #prompt-submit:hover:not(:disabled) { background: #383838; }
+        #prompt-submit:disabled { opacity: 0.35; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div id="video-container">
+        <video id="video" autoplay muted playsinline loop></video>
+        <span id="idle-message">Waiting for first prompt...</span>
+        <span id="state-badge" class="IDLE_LOOP">Idle</span>
+    </div>
+    <div id="prompt-area">
+        <div id="rejection-msg"></div>
+        <div id="prompt-row">
+            <input id="prompt-input" type="text" placeholder="Describe what happens next..." autocomplete="off" spellcheck="false" />
+            <button id="prompt-submit">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const video       = document.getElementById('video');
+        const badge       = document.getElementById('state-badge');
+        const input       = document.getElementById('prompt-input');
+        const submitBtn   = document.getElementById('prompt-submit');
+        const rejection   = document.getElementById('rejection-msg');
+        const idleMessage = document.getElementById('idle-message');
+
+        let sessionId            = null;
+        let pendingTransitionUrl = null;
+        let pendingTargetUrl     = null;
+        let inTransition         = false;
+
+        const STATE_LABELS = {
+            IDLE_LOOP:              'Idle',
+            GENERATING_TARGET:      'Generating...',
+            GENERATING_TRANSITION:  'Transitioning...',
+            PLAYING_TRANSITION:     'Playing transition',
+        };
+
+        function setStateBadge(state) {
+            badge.textContent  = STATE_LABELS[state] || state;
+            badge.className    = state;
+            submitBtn.disabled = state !== 'IDLE_LOOP';
+        }
+
+        function playVideo(url, loop) {
+            video.src  = url;
+            video.loop = loop;
+            idleMessage.style.display = 'none';
+            video.play().catch(() => {});
+        }
+
+        // Drive segment sequencing via the ended event so we never cut mid-loop.
+        video.addEventListener('ended', () => {
+            if (!inTransition && pendingTransitionUrl) {
+                inTransition = true;
+                playVideo(pendingTransitionUrl, false);
+                pendingTransitionUrl = null;
+            } else if (inTransition && pendingTargetUrl) {
+                inTransition = false;
+                playVideo(pendingTargetUrl, true);
+                pendingTargetUrl = null;
+            } else if (!inTransition && pendingTargetUrl) {
+                // No transition was generated -- cut directly to target.
+                playVideo(pendingTargetUrl, true);
+                pendingTargetUrl = null;
+            }
+        });
+
+        function handleSSEEvent(data) {
+            const { event, segment_url, state } = data;
+            switch (event) {
+                case 'current':
+                    // Initial sync on SSE connect.
+                    if (!video.src || video.src === window.location.href) {
+                        playVideo(segment_url, true);
+                    }
+                    break;
+
+                case 'transition':
+                    pendingTransitionUrl = segment_url;
+                    video.loop = false;   // let current loop end naturally
+                    break;
+
+                case 'target':
+                    pendingTargetUrl = segment_url;
+                    if (!pendingTransitionUrl && !inTransition) {
+                        video.loop = false;
+                    }
+                    break;
+
+                case 'state':
+                    setStateBadge(state);
+                    break;
+            }
+        }
+
+        async function sendPrompt() {
+            const text = input.value.trim();
+            if (!text || !sessionId) return;
+
+            input.value = '';
+            rejection.textContent = '';
+
+            try {
+                const resp = await fetch(`/sessions/${sessionId}/prompt`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text }),
+                });
+                const data = await resp.json();
+                if (data.status === 'rejected') {
+                    rejection.textContent = data.reason || 'Prompt rejected.';
+                }
+            } catch {
+                rejection.textContent = 'Failed to send prompt.';
+            }
+        }
+
+        submitBtn.addEventListener('click', sendPrompt);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendPrompt(); });
+
+        async function init() {
+            const resp = await fetch('/default-session');
+            const { session_id } = await resp.json();
+            sessionId = session_id;
+
+            const es = new EventSource(`/sessions/${sessionId}/events`);
+            es.onmessage = (e) => {
+                try {
+                    handleSSEEvent(JSON.parse(e.data));
+                } catch (err) {
+                    console.error('SSE parse error:', err);
+                }
+            };
+            es.onerror = () => console.warn('SSE connection dropped, browser will retry');
+        }
+
+        init().catch(console.error);
+    </script>
+</body>
+</html>
