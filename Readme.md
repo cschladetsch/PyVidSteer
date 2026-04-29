@@ -1,4 +1,4 @@
-# [!PyVidSteer](resources/icon.png)InteractiveGen
+# ![PyVidSteer](resources/icon.png) InteractiveGen
 
 > Natural language steering of generative video streams in real time.
 
